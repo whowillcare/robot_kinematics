@@ -1,11 +1,20 @@
 import 'dart:math';
 
-import 'package:kinematics/kinematics.dart';
+import 'package:robotic_kinematics/kinematics.dart';
 import 'package:test/test.dart';
 import 'package:vector_math/vector_math_64.dart';
 
+
+const discrepancy = 0.0001;
+
+extension EQUAL on double {
+  bool equal(double other, {double tolerance = discrepancy}){
+    return (this - other).abs() < tolerance;
+  }
+}
+
 void main() {
-  group('A group of tests', () {
+  group('Test of Kinematics:', () {
     final halfPi = pi/2.0;
     final iimt = [
       DHParameter(0.139, 0, halfPi),       // d1, a1, alpha1
@@ -25,11 +34,23 @@ void main() {
       -1.1499, // wrist3
     ];
 
+    final expectedCord = [
+      0.41338, // x
+      0.50142, // y
+      0.57895, // z
+      -3.1078, // rx
+      -0.0227, // ry
+      0.2642, // rz
+    ];
+
+
+
     setUp(() {
       // Additional setup goes here.
     });
 
-    test('First Test', () {
+    test('Forward', () {
+
       final endFactor = forwardKinematics(jointAngles, iimt);
       print(endFactor);
 
@@ -41,25 +62,34 @@ void main() {
       // Extract end-effector orientation
       final simpleRotation = T_final.getRotation();
       final orientation = Quaternion.fromRotation(simpleRotation);
-
-      print('End-effector position: $position');
-      print('End-effector simple: $simpleRotation');
-      print('End-effector orientation: $orientation');
-      print('Angles: ${orientation.eulerAngles}');
+      print("orientation: $orientation");
+      final coord = List<double>.generate(6,(_)=>0.0);
+      position.copyIntoArray(coord);
+      orientation.eulerAngles.copyIntoArray(coord,3);
+      print('Original: $expectedCord\ncalculated: $coord');
+      var i=0;
+      while(i<expectedCord.length){
+        final original=expectedCord[i], actual = coord[i];
+        expect(original.equal(actual),true);
+        i++;
+      }
     });
-    test('inverse', (){
+    test('Inverse', (){
       // Define the target position and orientation (in meters and radians)
-      Vector3 targetPosition = Vector3(0.41338, 0.50142, 0.57895);
-      Quaternion targetOrientation = Quaternion.axisAngle(Vector3(0, 0, 1), 0.2642)
-        *(Quaternion.axisAngle(Vector3(0, 1, 0), -0.0227))
-        *(Quaternion.axisAngle(Vector3(1, 0, 0), -3.1078));
+      Vector3 targetPosition = Vector3.array(expectedCord);
+      Quaternion targetOrientation = Quaternion.axisAngle(Vector3(0, 0, 1), expectedCord[5]) // rz
+        *(Quaternion.axisAngle(Vector3(0, 1, 0), expectedCord[4])) // ry
+        *(Quaternion.axisAngle(Vector3(1, 0, 0), expectedCord[3]) // rz
+          );
       print("position: $targetPosition $targetOrientation");
+      print('angles: ${targetOrientation.eulerAngles}');
       // Define the DH parameters
       final dhParameters = iimt;
 
       // Calculate the joint angles using inverse kinematics
-      List<double> jointAngles = inverseKinematics(targetPosition, targetOrientation, dhParameters);
-
+      // List<double> jointAngles = inverseKinematics(targetPosition, targetOrientation, dhParameters);
+      // List<double> jointAngles = particleSwarmOptimization(targetPosition, targetOrientation, dhParameters, swarmSize: 30, dimensions: 6, maxIterations: 1000);
+      List<double> jointAngles = ik(targetPosition, targetOrientation, dhParameters, swarmSize: 30, dimensions: 6, maxIterations: 1000);
       // Print the joint angles
       print('Joint Angles: $jointAngles');
 

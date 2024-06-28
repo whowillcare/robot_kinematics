@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'package:vector_math/vector_math_64.dart';
 import 'dart:math' as math;
 
@@ -111,9 +113,26 @@ List<double> inverseSimple(Vector3 targetPosition, Quaternion targetOrientation,
   return jointAngles;
 }
 
-Matrix4 computeJacobian(List<double> jointAngles, List<DHParameter> dhParameters) {
-  // Initialize the Jacobian matrix (6x6)
-  List<Vector4> columns = List.generate(6, (_) => Vector4.zero());
+List<List<double>> invert6x6Matrix(List<List<double>> matrix) {
+  // Implement 6x6 matrix inversion (placeholder with identity matrix for now)
+  List<List<double>> identity = List.generate(6, (i) => List.generate(6, (j) => i == j ? 1.0 : 0.0));
+  // Replace with actual inversion logic
+  return identity;
+}
+
+List<double> multiplyMatrixVector(List<List<double>> matrix, List<double> vector) {
+  List<double> result = List.filled(6, 0.0);
+  for (int i = 0; i < 6; i++) {
+    for (int j = 0; j < 6; j++) {
+      result[i] += matrix[i][j] * vector[j];
+    }
+  }
+  return result;
+}
+
+List<List<double>> computeJacobian(List<double> jointAngles, List<DHParameter> dhParameters, double perturbation) {
+  // Initialize the Jacobian matrix as a 6x6 list
+  List<List<double>> J = List.generate(6, (_) => List.filled(6, 0.0));
 
   // Forward kinematics to get the current end-effector position and orientation
   Matrix4 T_final = forwardKinematics(jointAngles, dhParameters);
@@ -124,32 +143,48 @@ Matrix4 computeJacobian(List<double> jointAngles, List<DHParameter> dhParameters
   for (int i = 0; i < jointAngles.length; i++) {
     // Perturb the current joint angle
     List<double> perturbedAngles = List.from(jointAngles);
-    perturbedAngles[i] += 0.001;
+    perturbedAngles[i] += perturbation;
 
     // Forward kinematics with the perturbed angle
     Matrix4 T_perturbed = forwardKinematics(perturbedAngles, dhParameters);
     Vector3 perturbedPosition = T_perturbed.getTranslation();
 
     // Compute the difference in position
-    Vector3 deltaPosition = (perturbedPosition - currentPosition) / 0.001;
+    Vector3 deltaPosition = (perturbedPosition - currentPosition) / perturbation;
 
     // Compute the difference in orientation
     Quaternion perturbedOrientation = Quaternion.fromRotation(T_perturbed.getRotation());
-    Quaternion deltaOrientation = perturbedOrientation - currentOrientation;
+    Quaternion deltaOrientation = perturbedOrientation * currentOrientation.conjugated();
+
+    // Convert deltaOrientation to angle-axis representation
+    Vector3 axis = Vector3.zero();
+    double angle = 2 * math.acos(deltaOrientation.w);
+    if (angle > perturbation) {
+      double s = math.sqrt(1 - deltaOrientation.w * deltaOrientation.w);
+      if (s < perturbation) {
+        axis.setValues(deltaOrientation.x, deltaOrientation.y, deltaOrientation.z);
+      } else {
+        axis.setValues(deltaOrientation.x / s, deltaOrientation.y / s, deltaOrientation.z / s);
+      }
+    }
+
+    Vector3 deltaOrientationVector = axis * angle;
 
     // Construct the Jacobian column for position
-    columns[i] = Vector4(deltaPosition.x, deltaPosition.y, deltaPosition.z, 0.0);
+    J[0][i] = deltaPosition.x;
+    J[1][i] = deltaPosition.y;
+    J[2][i] = deltaPosition.z;
 
     // Construct the Jacobian column for orientation
-    if (i < 3) {
-      columns[i + 3] = Vector4(deltaOrientation.x, deltaOrientation.y, deltaOrientation.z, 0.0);
-    }
+    J[3][i] = deltaOrientationVector.x;
+    J[4][i] = deltaOrientationVector.y;
+    J[5][i] = deltaOrientationVector.z;
   }
 
-  return Matrix4.columns(columns[0], columns[1], columns[2], columns[3]);
+  return J;
 }
 
-List<double> inverseKinematics(Vector3 targetPosition, Quaternion targetOrientation, List<DHParameter> dhParameters, {int maxIterations = 100, double tolerance = 1e-6}) {
+List<double> inverseKinematics(Vector3 targetPosition, Quaternion targetOrientation, List<DHParameter> dhParameters, {int maxIterations = 10000, double tolerance = 1e-6, double lambda = 0.1}) {
   // Initialize joint angles list
   List<double> jointAngles = List.filled(6, 0.0);
 
@@ -161,30 +196,328 @@ List<double> inverseKinematics(Vector3 targetPosition, Quaternion targetOrientat
 
     // Compute the position and orientation error
     Vector3 positionError = targetPosition - currentPosition;
-    Quaternion orientationError = targetOrientation * (currentOrientation..conjugate());
+    Quaternion orientationError = targetOrientation * currentOrientation.conjugated();
+
+    // Convert orientation error to angle-axis representation for easier manipulation
+    Vector3 axis = Vector3.zero();
+    double angle = 2 * math.acos(orientationError.w);
+    if (angle > tolerance) {
+      double s = math.sqrt(1 - orientationError.w * orientationError.w);
+      if (s < tolerance) {
+        axis.setValues(orientationError.x, orientationError.y, orientationError.z);
+      } else {
+        axis.setValues(orientationError.x / s, orientationError.y / s, orientationError.z / s);
+      }
+    }
+
+    Vector3 orientationErrorVector = axis * angle;
 
     // Check if the error is within the tolerance
-    if (positionError.length < tolerance && orientationError.length < tolerance) {
+    if (positionError.length < tolerance && orientationErrorVector.length < tolerance) {
       break;
     }
 
+    print('$iteration -> ${positionError.length} ${orientationErrorVector.length}');
     // Compute the Jacobian matrix
-    Matrix4 J = computeJacobian(jointAngles, dhParameters);
+    List<List<double>> J = computeJacobian(jointAngles, dhParameters, 1e-6);
 
-    // Compute the change in joint angles
-    Vector4 errorVector = Vector4(positionError.x, positionError.y, positionError.z, 0.0);
-    Matrix4 J_inv = J.clone()..invert();
-    Vector4 deltaAngles = J_inv.transform(errorVector);
+    // Combine position and orientation error vectors into a 6-element list
+    List<double> errorVector = [
+      positionError.x, positionError.y, positionError.z,
+      orientationErrorVector.x, orientationErrorVector.y, orientationErrorVector.z,
+    ];
 
-    // Update the joint angles
-    for (int i = 0; i < jointAngles.length; i++) {
-      if (i < 3) {
-        jointAngles[i] += deltaAngles[i];
-      } else {
-        jointAngles[i] += deltaAngles[i - 3];
+    // Construct the damped Jacobian matrix (J' * J + lambda^2 * I)
+    List<List<double>> JT = List.generate(6, (_) => List.filled(6, 0.0));
+    List<List<double>> JTJ = List.generate(6, (_) => List.filled(6, 0.0));
+    for (int i = 0; i < 6; i++) {
+      for (int j = 0; j < 6; j++) {
+        for (int k = 0; k < 6; k++) {
+          JT[i][j] += J[k][i] * J[k][j];
+        }
+        if (i == j) {
+          JTJ[i][j] = JT[i][j] + lambda * lambda;
+        } else {
+          JTJ[i][j] = JT[i][j];
+        }
       }
+    }
+
+    // Invert the damped Jacobian matrix
+    List<List<double>> JTJ_inv = invert6x6Matrix(JTJ);
+
+    // Compute J_inv * errorVector using the damped inverse Jacobian
+    List<double> deltaAngles = multiplyMatrixVector(JTJ_inv, errorVector);
+
+    print('Delta $deltaAngles');
+    // Update the joint angles with constraints
+    for (int i = 0; i < jointAngles.length; i++) {
+      jointAngles[i] += deltaAngles[i];
+      jointAngles[i] = jointAngles[i].clamp(-2 * math.pi, 2 * math.pi);
     }
   }
 
   return jointAngles;
+}
+
+
+
+class Particle {
+  late List<double> position;
+  late List<double> velocity;
+  late List<double> bestPosition;
+  late double bestFitness;
+
+  Particle(int dimensions) {
+    position = List<double>.filled(dimensions, 0);
+    velocity = List<double>.filled(dimensions, 0);
+    bestPosition = List<double>.filled(dimensions, 0);
+    bestFitness = double.infinity;
+  }
+}
+
+List<Particle> initializeSwarm(int swarmSize, int dimensions) {
+  List<Particle> swarm = [];
+  Random random = Random();
+
+  for (int i = 0; i < swarmSize; i++) {
+    Particle particle = Particle(dimensions);
+    for (int j = 0; j < dimensions; j++) {
+      particle.position[j] = -2 * pi + 4 * pi * random.nextDouble(); // Joint limits
+      particle.velocity[j] = -0.1 + 0.2 * random.nextDouble();
+    }
+    swarm.add(particle);
+  }
+  return swarm;
+}
+
+double objectiveFunction(List<double> jointAngles, Vector3 targetPosition, Quaternion targetOrientation, List<DHParameter> dhParameters) {
+  Matrix4 T_final = forwardKinematics(jointAngles, dhParameters);
+  Vector3 currentPosition = T_final.getTranslation();
+  Quaternion currentOrientation = Quaternion.fromRotation(T_final.getRotation());
+
+  Vector3 positionError = targetPosition - currentPosition;
+  Quaternion orientationError = targetOrientation * currentOrientation.conjugated();
+
+  Vector3 axis = Vector3.zero();
+  double angle = 2 * acos(orientationError.w);
+  if (angle > 1e-6) {
+    double s = sqrt(1 - orientationError.w * orientationError.w);
+    if (s < 1e-6) {
+      axis.setValues(orientationError.x, orientationError.y, orientationError.z);
+    } else {
+      axis.setValues(orientationError.x / s, orientationError.y / s, orientationError.z / s);
+    }
+  }
+  Vector3 orientationErrorVector = axis * angle;
+
+  double positionErrorNorm = positionError.length;
+  double orientationErrorNorm = orientationErrorVector.length;
+
+  return positionErrorNorm + orientationErrorNorm;
+}
+
+
+List<double> particleSwarmOptimization(Vector3 targetPosition, Quaternion targetOrientation, List<DHParameter> dhParameters, {int swarmSize = 30, int dimensions = 6, int maxIterations = 1000, double tolerance = 1e-6}) {
+  List<Particle> swarm = initializeSwarm(swarmSize, dimensions);
+  List<double> globalBestPosition = List<double>.filled(dimensions, 0);
+  double globalBestFitness = double.infinity;
+  double w = 0.9; // Start with a higher inertia weight
+  double wMin = 0.4; // Minimum inertia weight
+  double c1 = 2.0; // Cognitive coefficient
+  double c2 = 2.0; // Social coefficient
+  Random random = Random();
+
+  for (int iteration = 0; iteration < maxIterations; iteration++) {
+    for (Particle particle in swarm) {
+      double fitness = objectiveFunction(particle.position, targetPosition, targetOrientation, dhParameters);
+      if (fitness < particle.bestFitness) {
+        particle.bestFitness = fitness;
+        particle.bestPosition = List.from(particle.position);
+      }
+      if (fitness < globalBestFitness) {
+        globalBestFitness = fitness;
+        globalBestPosition = List.from(particle.position);
+      }
+      if (globalBestFitness < tolerance) {
+        print('Converged at iteration $iteration with fitness $globalBestFitness');
+        break;
+      }
+    }
+
+    // Check if the solution is within the tolerance
+    if (globalBestFitness < tolerance) {
+      print('Converged at iteration $iteration with fitness $globalBestFitness');
+      break;
+    }else {
+      //print('Continue iteration $iteration with fitness $globalBestFitness');
+    }
+
+    // Linearly decreasing inertia weight
+    w = wMin + (0.9 - wMin) * (maxIterations - iteration) / maxIterations;
+
+    for (Particle particle in swarm) {
+      for (int j = 0; j < dimensions; j++) {
+        double r1 = random.nextDouble();
+        double r2 = random.nextDouble();
+        particle.velocity[j] = w * particle.velocity[j] + c1 * r1 * (particle.bestPosition[j] - particle.position[j]) + c2 * r2 * (globalBestPosition[j] - particle.position[j]);
+        particle.position[j] += particle.velocity[j];
+        particle.position[j] = particle.position[j].clamp(-2 * pi, 2 * pi); // Joint limits
+      }
+    }
+  }
+  return globalBestPosition;
+}
+
+
+List<double> optimizeFirstThreeJoints(Vector3 targetPosition, List<DHParameter> dhParameters) {
+  // Objective function for the first three joints
+  double positionObjectiveFunction(List<double> jointAngles) {
+    // Use the first three joints for forward kinematics to get the current position
+    List<double> angles = jointAngles + [0.0, 0.0, 0.0]; // Extend to 6 DOF with zeros for the last three
+    Matrix4 T_final = forwardKinematics(angles, dhParameters);
+    Vector3 currentPosition = T_final.getTranslation();
+    return (targetPosition - currentPosition).length;
+  }
+
+  // Initial guess for the first three joints
+  List<double> initialJointAngles = [0.0, 0.0, 0.0];
+
+  // Optimization using PSO (or another optimizer)
+  List<double> optimizedJointAngles = particleSwarmOptimizationForSubset(positionObjectiveFunction, initialJointAngles, 3);
+
+  return optimizedJointAngles;
+}
+
+List<double> optimizeLastThreeJoints(Quaternion targetOrientation, List<DHParameter> dhParameters, List<double> firstThreeJointAngles) {
+  // Objective function for the last three joints
+  double orientationObjectiveFunction(List<double> jointAngles) {
+    // Combine the first three joint angles with the current last three
+    List<double> angles = firstThreeJointAngles + jointAngles;
+    Matrix4 T_final = forwardKinematics(angles, dhParameters);
+    Quaternion currentOrientation = Quaternion.fromRotation(T_final.getRotation());
+    Quaternion orientationError = targetOrientation * currentOrientation.conjugated();
+
+    Vector3 axis = Vector3.zero();
+    double angle = 2 * acos(orientationError.w);
+    if (angle > 1e-6) {
+      double s = sqrt(1 - orientationError.w * orientationError.w);
+      if (s < 1e-6) {
+        axis.setValues(orientationError.x, orientationError.y, orientationError.z);
+      } else {
+        axis.setValues(orientationError.x / s, orientationError.y / s, orientationError.z / s);
+      }
+    }
+    return axis.length * angle;
+  }
+
+  // Initial guess for the last three joints
+  List<double> initialJointAngles = [0.0, 0.0, 0.0];
+
+  // Optimization using PSO (or another optimizer)
+  List<double> optimizedJointAngles = particleSwarmOptimizationForSubset(orientationObjectiveFunction, initialJointAngles, 3);
+
+  return optimizedJointAngles;
+}
+
+
+List<double> particleSwarmOptimizationForSubset(Function objectiveFunction, List<double> initialJointAngles, int dimensions, {int swarmSize = 30, int maxIterations = 1000, double tolerance = 1e-6}) {
+  List<Particle> swarm = initializeSwarm(swarmSize, dimensions);
+  List<double> globalBestPosition = List<double>.filled(dimensions, 0);
+  double globalBestFitness = double.infinity;
+  double w = 0.9; // Start with a higher inertia weight
+  double wMin = 0.4; // Minimum inertia weight
+  double c1 = 2.0; // Cognitive coefficient
+  double c2 = 2.0; // Social coefficient
+  Random random = Random();
+
+  for (int iteration = 0; iteration < maxIterations; iteration++) {
+    for (Particle particle in swarm) {
+      double fitness = objectiveFunction(particle.position);
+      if (fitness < particle.bestFitness) {
+        particle.bestFitness = fitness;
+        particle.bestPosition = List.from(particle.position);
+      }
+      if (fitness < globalBestFitness) {
+        globalBestFitness = fitness;
+        globalBestPosition = List.from(particle.position);
+      }
+    }
+
+    // Check if the solution is within the tolerance
+    if (globalBestFitness < tolerance) {
+      print('Converged at iteration $iteration with fitness $globalBestFitness');
+      break;
+    }
+
+    // Linearly decreasing inertia weight
+    w = wMin + (0.9 - wMin) * (maxIterations - iteration) / maxIterations;
+
+    for (Particle particle in swarm) {
+      for (int j = 0; j < dimensions; j++) {
+        double r1 = random.nextDouble();
+        double r2 = random.nextDouble();
+        particle.velocity[j] = w * particle.velocity[j] + c1 * r1 * (particle.bestPosition[j] - particle.position[j]) + c2 * r2 * (globalBestPosition[j] - particle.position[j]);
+        particle.position[j] += particle.velocity[j];
+        particle.position[j] = particle.position[j].clamp(-2 * pi, 2 * pi); // Joint limits
+      }
+    }
+  }
+  return globalBestPosition;
+}
+
+List<double> ik(Vector3 targetPosition, Quaternion targetOrientation, List<DHParameter> dhParameters, {int swarmSize = 30, int dimensions = 6, int maxIterations = 1000, double tolerance = 1e-6}) {
+
+  // Objective function for the first three joints
+  double positionObjectiveFunction(List<double> jointAngles) {
+    // Use the first three joints for forward kinematics to get the current position
+    List<double> angles = jointAngles + [0.0, 0.0, 0.0]; // Extend to 6 DOF with zeros for the last three
+    Matrix4 T_final = forwardKinematics(angles, dhParameters);
+    Vector3 currentPosition = T_final.getTranslation();
+    return (targetPosition - currentPosition).length;
+  }
+  Function orientationObjectiveFunctionPrepare(List<double> firstThreeJointAngles) {
+  return
+    (List<double> jointAngles) {
+      // Combine the first three joint angles with the current last three
+      List<double> angles = firstThreeJointAngles + jointAngles;
+      Matrix4 T_final = forwardKinematics(angles, dhParameters);
+      Quaternion currentOrientation = Quaternion.fromRotation(T_final.getRotation());
+      Quaternion orientationError = targetOrientation * currentOrientation.conjugated();
+
+      Vector3 axis = Vector3.zero();
+      double angle = 2 * acos(orientationError.w);
+      if (angle > 1e-6) {
+        double s = sqrt(1 - orientationError.w * orientationError.w);
+        if (s < 1e-6) {
+          axis.setValues(orientationError.x, orientationError.y, orientationError.z);
+        } else {
+          axis.setValues(orientationError.x / s, orientationError.y / s, orientationError.z / s);
+        }
+      }
+      return axis.length * angle;
+    };
+  }
+
+  late List<double> firstThreeJointAngles, lastThreeJointAngles;
+  {
+    // Initial guess for the first three joints
+    List<double> initialJointAngles = [0.0, 0.0, 0.0];
+
+    // Optimization using PSO (or another optimizer)
+    List<double> optimizedJointAngles = particleSwarmOptimizationForSubset(
+        positionObjectiveFunction, initialJointAngles, 3, swarmSize: swarmSize, maxIterations: maxIterations, tolerance: tolerance);
+    firstThreeJointAngles = optimizedJointAngles;
+  }
+
+  {
+    // Initial guess for the last three joints
+    List<double> initialJointAngles = [0.0, 0.0, 0.0];
+    // Optimization using PSO (or another optimizer)
+    List<double> optimizedJointAngles = particleSwarmOptimizationForSubset(
+        orientationObjectiveFunctionPrepare(firstThreeJointAngles), initialJointAngles, 3, swarmSize: swarmSize, maxIterations: maxIterations, tolerance: tolerance);
+    lastThreeJointAngles = optimizedJointAngles;
+  }
+
+  return firstThreeJointAngles + lastThreeJointAngles;
 }

@@ -1,4 +1,4 @@
-import 'package:kinematics/kinematics.dart';
+import 'package:robotic_kinematics/kinematics.dart';
 
 void main() {
   final jointAngles = [-2.32, -1.647, 2.658, -4.088, 4.128, 1.685];
